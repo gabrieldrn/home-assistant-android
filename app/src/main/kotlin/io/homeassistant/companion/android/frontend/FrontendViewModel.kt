@@ -47,6 +47,7 @@ import io.homeassistant.companion.android.frontend.js.FrontendJsCallback
 import io.homeassistant.companion.android.frontend.matterthread.FrontendMatterThreadHandler
 import io.homeassistant.companion.android.frontend.navigation.FrontendEvent
 import io.homeassistant.companion.android.frontend.navigation.FrontendRoute
+import io.homeassistant.companion.android.frontend.navigation.FrontendTarget
 import io.homeassistant.companion.android.frontend.permissions.PermissionManager
 import io.homeassistant.companion.android.frontend.url.FrontendUrlManager
 import io.homeassistant.companion.android.frontend.url.UrlLoadResult
@@ -108,7 +109,7 @@ private val FIRST_VIEW_EXCLUDED_URL_REGEX =
 @HiltViewModel
 internal class FrontendViewModel @VisibleForTesting constructor(
     initialServerId: Int,
-    initialPath: String?,
+    initialTarget: FrontendTarget,
     webViewClientFactory: HAWebViewClientFactory,
     private val frontendBusObserver: FrontendBusObserver,
     private val externalBusRepository: FrontendExternalBusRepository,
@@ -155,7 +156,7 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         @NamedKeyChain keyChainRepository: KeyChainRepository,
     ) : this(
         initialServerId = savedStateHandle.toRoute<FrontendRoute>().serverId,
-        initialPath = savedStateHandle.toRoute<FrontendRoute>().path,
+        initialTarget = savedStateHandle.toRoute<FrontendRoute>().target,
         webViewClientFactory = webViewClientFactory,
         frontendBusObserver = frontendBusObserver,
         externalBusRepository = externalBusRepository,
@@ -213,7 +214,7 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private val _viewState = ViewStateManager(
         FrontendViewState.LoadServer(
             serverId = initialServerId,
-            path = initialPath,
+            target = initialTarget,
         ),
     )
     val viewState: StateFlow<FrontendViewState> = _viewState
@@ -287,6 +288,13 @@ internal class FrontendViewModel @VisibleForTesting constructor(
 
     /** Job tracking the zoom settings flow collection - restarted on each page load. */
     private var zoomObserverJob: Job? = null
+
+    /**
+     * Entity whose more-info dialog must be opened via JavaScript once the page finishes loading.
+     * Set for servers older than HA 2025.6 (see [UrlLoadResult.Success.moreInfoEntityId]) and
+     * cleared after it is dispatched in [onPageFinished].
+     */
+    private var pendingMoreInfoEntityId: String? = null
 
     /**
      * The user's "Autoplay video" preference.
@@ -380,7 +388,10 @@ internal class FrontendViewModel @VisibleForTesting constructor(
                 when (event) {
                     is FrontendImprovHandler.Event.ReloadAtPath -> {
                         _viewState.update {
-                            FrontendViewState.LoadServer(serverId = event.serverId, path = event.path)
+                            FrontendViewState.LoadServer(
+                                serverId = event.serverId,
+                                target = FrontendTarget.Path(event.path),
+                            )
                         }
                     }
                 }
@@ -725,14 +736,14 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         urlFlowJob = viewModelScope.launch {
             permissionManager.checkLocalNetworkPermission()
             val currentState = _viewState.value
-            val path = when (currentState) {
-                is FrontendViewState.LoadServer -> currentState.path
-                is FrontendViewState.Loading -> currentState.path
-                else -> null
+            val target = when (currentState) {
+                is FrontendViewState.LoadServer -> currentState.target
+                is FrontendViewState.Loading -> currentState.target
+                else -> FrontendTarget.Default
             }
             urlManager.serverUrlFlow(
                 serverId = currentState.serverId,
-                path = path,
+                target = target,
             ).collect { result ->
                 handleUrlResult(result)
             }
@@ -911,11 +922,12 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private fun handleUrlResult(result: UrlLoadResult) {
         when (result) {
             is UrlLoadResult.Success -> {
+                pendingMoreInfoEntityId = result.moreInfoEntityId
                 _viewState.update {
                     FrontendViewState.Loading(
                         serverId = result.serverId,
                         url = result.url,
-                        path = null,
+                        target = FrontendTarget.Default,
                     )
                 }
             }
@@ -1084,6 +1096,12 @@ internal class FrontendViewModel @VisibleForTesting constructor(
      * to react to settings changes until the next page load restarts it.
      */
     private fun onPageFinished(url: String?) {
+        // Open the more-info dialog for an older-server deep link now that the frontend has loaded.
+        pendingMoreInfoEntityId?.let { entityId ->
+            pendingMoreInfoEntityId = null
+            viewModelScope.launch { _webViewActions.emit(WebViewAction.OpenMoreInfo(entityId)) }
+        }
+
         zoomObserverJob?.cancel()
         zoomObserverJob = viewModelScope.launch {
             prefsRepository.zoomSettingsFlow().collect { settings ->
