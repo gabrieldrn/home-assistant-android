@@ -1,5 +1,6 @@
 package io.homeassistant.companion.android.frontend.navigation
 
+import android.content.Intent
 import android.content.IntentSender
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -21,9 +22,8 @@ import io.homeassistant.companion.android.assist.AssistActivity
 import io.homeassistant.companion.android.common.data.servers.ServerManager.Companion.SERVER_ID_ACTIVE
 import io.homeassistant.companion.android.frontend.FrontendScreen
 import io.homeassistant.companion.android.frontend.FrontendViewModel
-import io.homeassistant.companion.android.frontend.url.launchAppOrStore
-import io.homeassistant.companion.android.frontend.url.launchIntentUri
 import io.homeassistant.companion.android.launch.HAStartDestinationRoute
+import io.homeassistant.companion.android.launch.LaunchActivity
 import io.homeassistant.companion.android.launch.PipReadiness
 import io.homeassistant.companion.android.nfc.WriteNfcTag
 import io.homeassistant.companion.android.settings.SettingsActivity
@@ -67,6 +67,10 @@ internal fun NavController.navigateToFrontend(
  * @param onShowSnackbar Callback to show snackbar messages
  * @param onShowServerSwitcher Callback to display the server switcher bottom sheet. Receives an
  *   `onServerSelected` callback that must be invoked with the chosen server ID.
+ * @param onLaunchApp Callback to launch an installed app (or its store page) by package name
+ * @param onLaunchIntent Callback to launch an Android `intent:` URI
+ * @param onOpenSecuritySettings Callback to open the OS security settings (client-certificate installation)
+ * @param onUpdateWebView Callback to open the current WebView provider's update page
  */
 internal fun NavGraphBuilder.frontendScreen(
     navController: NavController,
@@ -77,6 +81,10 @@ internal fun NavGraphBuilder.frontendScreen(
     onConfigureHomeNetwork: (serverId: Int) -> Unit,
     onShowSnackbar: suspend (message: String, action: String?) -> Boolean,
     onShowServerSwitcher: (onServerSelected: (Int) -> Unit) -> Unit,
+    onLaunchApp: suspend (packageName: String) -> Unit = {},
+    onLaunchIntent: suspend (intentUri: String) -> Unit = {},
+    onOpenSecuritySettings: suspend () -> Unit = {},
+    onUpdateWebView: suspend () -> Unit = {},
     onRequestFullscreen: (Boolean) -> Unit = {},
     onPipReadinessChanged: (PipReadiness?) -> Unit = {},
 ) {
@@ -95,6 +103,17 @@ internal fun NavGraphBuilder.frontendScreen(
                 events = viewModel.events,
                 onShowSnackbar = onShowSnackbar,
                 onNavigateToSettings = onNavigateToSettings,
+                onRelaunch = {
+                    val context = navController.context
+                    // Clear the task so the relaunch starts from scratch and back can't return to
+                    // the pre-relaunch state (e.g. after removing the server or clearing credentials).
+                    context.startActivity(
+                        LaunchActivity.newInstance(context).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                        },
+                    )
+                    context.getActivity()?.finish()
+                },
                 onNavigateToAssist = { serverId, pipelineId, startListening ->
                     navController.context.startActivity(
                         AssistActivity.newInstance(
@@ -118,8 +137,10 @@ internal fun NavGraphBuilder.frontendScreen(
                     val context = navController.context
                     context.startActivity(widgetType.toConfigureIntent(context, entityId))
                 },
-                onLaunchApp = { packageName -> navController.context.launchAppOrStore(packageName) },
-                onLaunchIntent = { intentUri -> navController.context.launchIntentUri(intentUri) },
+                onLaunchApp = onLaunchApp,
+                onLaunchIntent = onLaunchIntent,
+                onOpenSecuritySettings = onOpenSecuritySettings,
+                onUpdateWebView = onUpdateWebView,
             )
 
             FrontendScreen(
@@ -165,8 +186,11 @@ internal fun FrontendEventHandler(
     onLaunchMatterThreadIntent: (IntentSender) -> Unit,
     onRequestFullscreen: (Boolean) -> Unit,
     onNavigateToWidgetConfig: (entityId: String, widgetType: WidgetType) -> Unit,
-    onLaunchApp: (packageName: String) -> Unit = {},
-    onLaunchIntent: (intentUri: String) -> Unit = {},
+    onLaunchApp: suspend (packageName: String) -> Unit = {},
+    onLaunchIntent: suspend (intentUri: String) -> Unit = {},
+    onOpenSecuritySettings: suspend () -> Unit = {},
+    onUpdateWebView: suspend () -> Unit = {},
+    onRelaunch: () -> Unit = {},
 ) {
     val resources = LocalResources.current
     LaunchedEffect(Unit) {
@@ -184,6 +208,9 @@ internal fun FrontendEventHandler(
                 }
 
                 is FrontendEvent.NavigateToSettings -> onNavigateToSettings(null)
+                is FrontendEvent.OpenSecuritySettings -> onOpenSecuritySettings()
+                is FrontendEvent.UpdateWebView -> onUpdateWebView()
+                is FrontendEvent.Relaunch -> onRelaunch()
                 is FrontendEvent.NavigateToAssistSettings -> onNavigateToSettings(
                     SettingsActivity.Deeplink.AssistSettings,
                 )
