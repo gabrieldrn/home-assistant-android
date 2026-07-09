@@ -20,6 +20,7 @@ import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.prefs.ScreenOrientation
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.util.GestureDirection
+import io.homeassistant.companion.android.frontend.WebViewAction.ApplySafeAreaInsets.Companion.SafeAreaInsets
 import io.homeassistant.companion.android.frontend.auth.FrontendHttpAuthHandler
 import io.homeassistant.companion.android.frontend.auth.HttpAuthResult
 import io.homeassistant.companion.android.frontend.barcode.FrontendBarcodeScannerHandler
@@ -227,6 +228,15 @@ internal class FrontendViewModel @VisibleForTesting constructor(
 
     private val _webViewActions = MutableSharedFlow<WebViewAction>(extraBufferCapacity = 1)
     val webViewActions: Flow<WebViewAction> = merge(_webViewActions, frontendBusObserver.webViewActions())
+
+    /**
+     * Latest device safe-area insets reported by the screen, reapplied to the frontend on connect and
+     * after each page load. Null until the screen first reports them.
+     *
+     * Only accessed on the main thread: writes come from the Compose reporter effect and reads run in
+     * [viewModelScope] (the main dispatcher), so no additional synchronization is needed.
+     */
+    private var latestSafeAreaInsets: SafeAreaInsets? = null
 
     override val urlFlow: StateFlow<String?> =
         _viewState.map { it.url }
@@ -779,32 +789,14 @@ internal class FrontendViewModel @VisibleForTesting constructor(
 
     private suspend fun handleMessageResult(result: FrontendHandlerEvent) {
         when (result) {
-            is FrontendHandlerEvent.Connected -> {
-                val wasLoading = _viewState.value is FrontendViewState.Loading
-                _viewState.update { currentState ->
-                    if (currentState is FrontendViewState.Loading) {
-                        FrontendViewState.Content(
-                            serverId = currentState.serverId,
-                            url = currentState.url,
-                        )
-                    } else {
-                        currentState
-                    }
-                }
-                if (wasLoading) {
-                    // Remove any previous navigation
-                    _webViewActions.emit(WebViewAction.ClearHistory())
-                    checkSecurityVersion(_viewState.value.serverId)
-                }
-                permissionManager.checkNotificationPermission(_viewState.value.serverId)
-            }
+            is FrontendHandlerEvent.Connected -> onConnected()
 
             is FrontendHandlerEvent.Disconnected -> {
                 // Disconnection handling not yet implemented
             }
 
             is FrontendHandlerEvent.ThemeUpdated -> {
-                // Theme update handling not yet implemented
+                viewModelScope.launch { updateThemeColors() }
             }
 
             is FrontendHandlerEvent.OpenSettings -> {
@@ -1089,13 +1081,16 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     /**
      * Called when a page finishes loading in the WebView.
      *
-     * Cancels any previous zoom observer and starts a fresh collection of
+     * Reapplies the frontend safe-area insets, which a full page (re)load resets. Cancels any
+     * previous zoom observer and starts a fresh collection of
      * [PrefsRepository.zoomSettingsFlow]. Because the flow emits the current values
      * on start, this immediately applies zoom against the loaded DOM (needed because
      * navigations can reset the viewport meta tag). The collection then stays active
      * to react to settings changes until the next page load restarts it.
      */
     private fun onPageFinished(url: String?) {
+        viewModelScope.launch { applySafeAreaInsetsIfHandled() }
+
         // Open the more-info dialog for an older-server deep link now that the frontend has loaded.
         pendingMoreInfoEntityId?.let { entityId ->
             pendingMoreInfoEntityId = null
@@ -1111,6 +1106,86 @@ internal class FrontendViewModel @VisibleForTesting constructor(
                         pinchToZoomEnabled = settings.pinchToZoomEnabled,
                     ),
                 )
+            }
+        }
+    }
+
+    /**
+     * Whether the server's frontend handles safe-area insets itself,
+     * allowing the WebView to be drawn edge-to-edge behind the navigation bar and display cutouts.
+     */
+    private suspend fun serverHandlesInsets(serverId: Int): Boolean {
+        return serverManager.getServer(serverId)?.version?.isAtLeast(2026, 2, 0) == true
+    }
+
+    /**
+     * Transitions from [FrontendViewState.Loading] to [FrontendViewState.Content] once the frontend
+     * connects, clearing the intermediate navigation history and syncing the system bar colors to
+     * the now-available frontend theme.
+     */
+    private suspend fun onConnected() {
+        val wasLoading = _viewState.value is FrontendViewState.Loading
+        val serverHandleInsets = serverHandlesInsets(_viewState.value.serverId)
+        _viewState.update { currentState ->
+            if (currentState is FrontendViewState.Loading) {
+                FrontendViewState.Content(
+                    serverId = currentState.serverId,
+                    url = currentState.url,
+                    serverHandleInsets = serverHandleInsets,
+                )
+            } else {
+                currentState
+            }
+        }
+        if (wasLoading) {
+            // Remove any previous navigation
+            _webViewActions.emit(WebViewAction.ClearHistory())
+            checkSecurityVersion(_viewState.value.serverId)
+        }
+        permissionManager.checkNotificationPermission(_viewState.value.serverId)
+        viewModelScope.launch { updateThemeColors() }
+        viewModelScope.launch { applySafeAreaInsetsIfHandled() }
+    }
+
+    /**
+     * Reports the device safe-area [insets] read from the screen. Reapplied to the frontend whenever
+     * they change so it stays laid out edge-to-edge across rotations and display cutout changes.
+     */
+    fun onSafeAreaInsetsChanged(insets: SafeAreaInsets) {
+        if (latestSafeAreaInsets == insets) return
+        latestSafeAreaInsets = insets
+        viewModelScope.launch { applySafeAreaInsetsIfHandled() }
+    }
+
+    /**
+     * Pushes the last reported safe-area insets to the frontend, but only when the current server
+     * handles its own insets (see [serverHandlesInsets]) and insets have been reported.
+     */
+    private suspend fun applySafeAreaInsetsIfHandled() {
+        val insets = latestSafeAreaInsets ?: return
+        if ((_viewState.value as? FrontendViewState.Content)?.serverHandleInsets != true) return
+        _webViewActions.emit(WebViewAction.ApplySafeAreaInsets(insets))
+    }
+
+    /**
+     * Reads the frontend's current theme colors and applies them to the status bar and page
+     * background of the [FrontendViewState.Content] state. No-op when not in the content state or
+     * when the frontend colors cannot be read.
+     */
+    private suspend fun updateThemeColors() {
+        val action = WebViewAction.ReadThemeColors()
+        _webViewActions.emit(action)
+        val colors = action.result.await()
+        if (colors == null) {
+            Timber.w("Could not read theme colors from the frontend")
+            return
+        }
+
+        _viewState.update { state ->
+            if (state is FrontendViewState.Content) {
+                state.copy(statusBarColor = colors.statusBarColor, backgroundColor = colors.backgroundColor)
+            } else {
+                state
             }
         }
     }
